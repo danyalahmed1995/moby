@@ -1,0 +1,188 @@
+name: swarm-overlay-neigh-lab
+
+on:
+  push:
+    branches:
+      - ci/52661-swarm-overlay-lab
+  workflow_dispatch:
+
+jobs:
+  swarm-overlay-neigh-lab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Host info
+        run: |
+          set -eux
+          uname -a
+          docker version
+          docker info
+
+      - name: Create DinD swarm nodes
+        run: |
+          set -eux
+
+          docker network create swarm-lab
+
+          docker run -d --privileged --name sw-mgr --hostname sw-mgr \
+            --network swarm-lab docker:29-dind
+
+          docker run -d --privileged --name sw-w1 --hostname sw-w1 \
+            --network swarm-lab docker:29-dind
+
+          docker run -d --privileged --name sw-w2 --hostname sw-w2 \
+            --network swarm-lab docker:29-dind
+
+          sleep 35
+
+          for n in sw-mgr sw-w1 sw-w2; do
+            echo "===== $n setup ====="
+            docker exec "$n" sh -lc 'apk add --no-cache iproute2 util-linux curl bind-tools'
+            docker exec "$n" docker version
+            docker exec "$n" docker info
+          done
+
+      - name: Init swarm
+        run: |
+          set -eux
+
+          MGR_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' sw-mgr)
+
+          docker exec sw-mgr docker swarm init --advertise-addr "$MGR_IP"
+
+          TOKEN=$(docker exec sw-mgr docker swarm join-token worker -q)
+
+          docker exec sw-w1 docker swarm join --token "$TOKEN" "$MGR_IP:2377"
+          docker exec sw-w2 docker swarm join --token "$TOKEN" "$MGR_IP:2377"
+
+          docker exec sw-mgr docker node ls
+
+      - name: Create overlay workload
+        run: |
+          set -eux
+
+          docker exec sw-mgr docker network create -d overlay --attachable proxy
+
+          docker exec sw-mgr docker service create \
+            --name web \
+            --network proxy \
+            --replicas 2 \
+            nginx:alpine
+
+          docker exec sw-mgr docker service create \
+            --name pinger \
+            --network proxy \
+            --mode global \
+            alpine sh -c 'while true; do wget -q -T 2 -O- http://web >/dev/null || echo FAIL; sleep 1; done'
+
+          sleep 45
+
+          docker exec sw-mgr docker service ls
+          docker exec sw-mgr docker service ps web --no-trunc
+          docker exec sw-mgr docker service ps pinger --no-trunc
+
+      - name: Baseline overlay namespace state
+        run: |
+          set +e
+
+          for n in sw-mgr sw-w1 sw-w2; do
+            echo "===== BASELINE $n netns ====="
+            docker exec "$n" sh -lc 'ls -la /var/run/docker/netns || true'
+
+            echo "===== BASELINE $n neigh/fdb ====="
+            docker exec "$n" sh -lc '
+              for ns in /var/run/docker/netns/1-*; do
+                [ -e "$ns" ] || continue
+                echo "--- namespace: $ns"
+                echo "--- ip neigh"
+                nsenter --net="$ns" ip neigh show || true
+                echo "--- bridge fdb"
+                nsenter --net="$ns" bridge fdb show || true
+              done
+            '
+          done
+
+      - name: Stress redeploy web service
+        run: |
+          set +e
+
+          for i in $(seq 1 100); do
+            echo "===== redeploy $i ====="
+            docker exec sw-mgr docker service update --force web
+
+            sleep 5
+
+            docker exec sw-mgr docker service ps web --no-trunc | sed -n '1,20p'
+
+            if [ $((i % 10)) -eq 0 ]; then
+              echo "===== sample pinger logs after redeploy $i ====="
+              docker exec sw-mgr docker service logs --tail 50 pinger || true
+            fi
+          done
+
+      - name: Remove and recreate web service
+        run: |
+          set +e
+
+          docker exec sw-mgr docker service rm web
+          sleep 30
+
+          docker exec sw-mgr docker service create \
+            --name web \
+            --network proxy \
+            --replicas 2 \
+            nginx:alpine
+
+          sleep 45
+
+          for i in $(seq 1 40); do
+            echo "===== redeploy after recreate $i ====="
+            docker exec sw-mgr docker service update --force web
+            sleep 5
+          done
+
+      - name: Final overlay namespace state
+        if: always()
+        run: |
+          set +e
+
+          for n in sw-mgr sw-w1 sw-w2; do
+            echo "===== FINAL $n containers ====="
+            docker exec "$n" docker ps -a || true
+
+            echo "===== FINAL $n networks ====="
+            docker exec "$n" docker network ls || true
+
+            echo "===== FINAL $n netns ====="
+            docker exec "$n" sh -lc 'ls -la /var/run/docker/netns || true'
+
+            echo "===== FINAL $n neigh/fdb ====="
+            docker exec "$n" sh -lc '
+              for ns in /var/run/docker/netns/1-*; do
+                [ -e "$ns" ] || continue
+                echo "--- namespace: $ns"
+
+                echo "--- ip neigh permanent"
+                nsenter --net="$ns" ip neigh show | grep PERMANENT || true
+
+                echo "--- ip neigh all"
+                nsenter --net="$ns" ip neigh show || true
+
+                echo "--- bridge fdb"
+                nsenter --net="$ns" bridge fdb show || true
+              done
+            '
+
+            echo "===== FINAL $n pinger logs ====="
+            PINGER_ID=$(docker exec "$n" docker ps -q --filter name=pinger | head -n 1)
+            if [ -n "$PINGER_ID" ]; then
+              docker exec "$n" docker logs "$PINGER_ID" --tail 100 || true
+            fi
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker rm -f sw-mgr sw-w1 sw-w2 || true
+          docker network rm swarm-lab || true
